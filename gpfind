@@ -1,0 +1,142 @@
+#!/Users/marie/.local/share/google-photos-sync/.venv/bin/python
+"""Google 포토에서 촬영 날짜와 파일 이름으로 찾고, 원하면 원본을 받는다.
+
+google-photos-sync(github.com/trialuser/google-photos-sync)의 비공식 웹 API 클라이언트를 쓴다.
+로그인 정보: /Users/marie/.local/share/google-photos-sync/gpsync-data (이 맥 안에만 둠)
+
+  gpfind login                      Chromium 창에서 로그인 (사진 목록이 뜨면 자동 저장)
+  gpfind whoami [--account N]       로그인된 계정 확인
+  gpfind search --from 2019-07-29 [--to 2019-07-31] [--name DSC01621 ...] [--account N] [--download 폴더]
+  gpfind logout                     로그인 정보 지우기
+
+날짜는 한국 시간 촬영일 기준(끝 날짜 포함). --name은 파일 이름 앞부분, 대소문자 무시.
+Google 포토에서 지우거나 바꾸는 기능은 없다.
+"""
+import argparse, datetime as dt, sys, time
+from pathlib import Path
+
+ROOT = Path("/Users/marie/.local/share/google-photos-sync")
+DATA = ROOT / "gpsync-data"
+COOKIES = DATA / "cookies.txt"
+KST = dt.timezone(dt.timedelta(hours=9))
+
+
+def login():
+    from playwright.sync_api import sync_playwright
+    from gpsync.auth import write_netscape_cookies
+    DATA.mkdir(mode=0o700, exist_ok=True)
+    print("Chromium 창에서 Google 포토에 로그인하세요. 사진 목록이 뜨면 자동으로 저장합니다(최대 15분).", flush=True)
+    with sync_playwright() as p:
+        ctx = p.chromium.launch_persistent_context(
+            user_data_dir=str(DATA / "browser-profile"), headless=False,
+            viewport={"width": 1280, "height": 800},
+            args=["--disable-blink-features=AutomationControlled"])
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.goto("https://photos.google.com/", wait_until="domcontentloaded")
+        deadline = time.time() + 900
+        while time.time() < deadline:
+            try:
+                url = page.url
+            except Exception:
+                sys.exit("창이 닫혀서 로그인을 저장하지 못했습니다. gpfind login을 다시 실행하세요.")
+            names = {c["name"] for c in ctx.cookies()}
+            if url.startswith("https://photos.google.com/") and "SID" in names:
+                time.sleep(3)
+                write_netscape_cookies(COOKIES, ctx.cookies())
+                COOKIES.chmod(0o600)
+                ctx.close()
+                print("로그인 저장 완료", flush=True)
+                return
+            time.sleep(2)
+        ctx.close()
+        sys.exit("15분 안에 로그인이 끝나지 않았습니다.")
+
+
+def client(account):
+    from gpsync.client import PhotosClient
+    if not COOKIES.exists():
+        sys.exit("로그인 정보가 없습니다. 먼저 gpfind login을 실행하세요.")
+    return PhotosClient(COOKIES, account, 0.3)
+
+
+def search(a):
+    from gpsync.download import _http_download
+    from gpsync.util import unix_seconds
+    c = client(a.account)
+    print("계정:", c.email, flush=True)
+    lo = dt.datetime.fromisoformat(a.date_from).replace(tzinfo=KST).timestamp()
+    hi = (dt.datetime.fromisoformat(a.date_to or a.date_from).replace(tzinfo=KST) + dt.timedelta(days=1)).timestamp()
+    probe = c.get_library_page()
+    ts0 = next((i.timestamp for i in probe.items if i.timestamp), None)
+    mult = 1_000_000 if ts0 and ts0 > 10**14 else 1000 if ts0 and ts0 > 10**11 else 1
+
+    keys, page_id, ts, pages = [], None, int(hi * mult), 0
+    while pages < 200:
+        p = c.get_library_page(timestamp=ts, page_id=page_id)
+        pages += 1
+        old = False
+        for it in p.items:
+            t = unix_seconds(it.timestamp)
+            if t is None:
+                continue
+            if t < lo:
+                old = True
+            elif t < hi and it.media_key:
+                keys.append(it.media_key)
+        if old or not p.next_page_id:
+            break
+        page_id, ts = p.next_page_id, p.last_item_timestamp
+    keys = list(dict.fromkeys(keys))
+    infos = []
+    for o in range(0, len(keys), 80):
+        infos += c.get_batch_media_info(keys[o:o + 80])
+    stems = [s.upper() for s in (a.name or [])]
+    hits = [i for i in infos if not stems or any((i.file_name or "").upper().startswith(s) for s in stems)]
+    hits.sort(key=lambda i: unix_seconds(i.timestamp) or 0)
+    print(f"기간 안 항목 {len(infos)}개, 조건에 맞는 것 {len(hits)}개", flush=True)
+    for i in hits:
+        t = dt.datetime.fromtimestamp(unix_seconds(i.timestamp), KST)
+        print(f"{t:%Y-%m-%d %H:%M:%S}\t{i.size or '?'}\t{i.file_name}", flush=True)
+    if a.download and hits:
+        out = Path(a.download).expanduser()
+        out.mkdir(parents=True, exist_ok=True)
+        for i in hits:
+            info = c.get_item_info(i.media_key)
+            url = (info.download_original_url or info.download_url) if info else None
+            url = url or c.get_download_url([i.media_key])
+            if not url:
+                print("받기 실패(주소 없음):", i.file_name, flush=True)
+                continue
+            taken = dt.datetime.fromtimestamp(unix_seconds(i.timestamp), KST)
+            d = _http_download(c, url, out, i.file_name, i.media_key, taken)
+            print("받음:", d, d.stat().st_size, flush=True)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Google 포토 촬영일·파일명 검색과 원본 받기")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("login")
+    sub.add_parser("logout")
+    w = sub.add_parser("whoami"); w.add_argument("--account", type=int, default=0)
+    s = sub.add_parser("search")
+    s.add_argument("--from", dest="date_from", required=True, help="YYYY-MM-DD (한국 시간 촬영일)")
+    s.add_argument("--to", dest="date_to", help="YYYY-MM-DD, 없으면 --from 하루만")
+    s.add_argument("--name", nargs="*", help="파일 이름 앞부분 (여러 개 가능)")
+    s.add_argument("--account", type=int, default=0, help="photos.google.com/u/N 의 N")
+    s.add_argument("--download", help="원본을 받을 폴더")
+    a = ap.parse_args()
+    if a.cmd == "login":
+        login()
+    elif a.cmd == "logout":
+        import shutil
+        COOKIES.unlink(missing_ok=True)
+        shutil.rmtree(DATA / "browser-profile", ignore_errors=True)
+        print("로그인 정보 삭제 완료")
+    elif a.cmd == "whoami":
+        print(client(a.account).email)
+    else:
+        search(a)
+
+
+if __name__ == "__main__":
+    main()
