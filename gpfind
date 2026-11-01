@@ -1,24 +1,28 @@
-#!/Users/marie/.local/share/google-photos-sync/.venv/bin/python
+#!/usr/bin/env python3
 """Google 포토에서 촬영 날짜와 파일 이름으로 찾고, 원하면 원본을 받는다.
 
 google-photos-sync(github.com/trialuser/google-photos-sync)의 비공식 웹 API 클라이언트를 쓴다.
-로그인 정보: /Users/marie/.local/share/google-photos-sync/gpsync-data (이 맥 안에만 둠)
+로그인 정보: ~/.local/share/google-photos-sync/gpsync-data (이 맥 안에만 둠)
 
   gpfind login                      Chromium 창에서 로그인 (사진 목록이 뜨면 자동 저장)
   gpfind whoami [--account N]       로그인된 계정 확인
   gpfind search --from 2019-07-29 [--to 2019-07-31] [--name DSC01621 ...] [--account N] [--download 폴더]
   gpfind logout                     로그인 정보 지우기
 
-날짜는 한국 시간 촬영일 기준(끝 날짜 포함). --name은 파일 이름 앞부분, 대소문자 무시.
+날짜는 이 맥의 시간대 기준 촬영일(끝 날짜 포함). --name은 파일 이름 앞부분, 대소문자 무시.
 Google 포토에서 지우거나 바꾸는 기능은 없다.
 """
-import argparse, datetime as dt, sys, time
+import argparse, datetime as dt, os, sys, time
 from pathlib import Path
 
-ROOT = Path("/Users/marie/.local/share/google-photos-sync")
+ROOT = Path.home() / ".local/share/google-photos-sync"
+VENV_PY = ROOT / ".venv/bin/python"
+if not VENV_PY.exists():
+    sys.exit(f"{ROOT} 에 google-photos-sync가 없습니다. 레포의 install.sh를 먼저 실행하세요.")
+if Path(sys.prefix).resolve() != (ROOT / ".venv").resolve():
+    os.execv(str(VENV_PY), [str(VENV_PY), os.path.realpath(__file__), *sys.argv[1:]])
 DATA = ROOT / "gpsync-data"
 COOKIES = DATA / "cookies.txt"
-KST = dt.timezone(dt.timedelta(hours=9))
 
 
 def login():
@@ -64,8 +68,8 @@ def search(a):
     from gpsync.util import unix_seconds
     c = client(a.account)
     print("계정:", c.email, flush=True)
-    lo = dt.datetime.fromisoformat(a.date_from).replace(tzinfo=KST).timestamp()
-    hi = (dt.datetime.fromisoformat(a.date_to or a.date_from).replace(tzinfo=KST) + dt.timedelta(days=1)).timestamp()
+    lo = dt.datetime.fromisoformat(a.date_from).astimezone().timestamp()
+    hi = (dt.datetime.fromisoformat(a.date_to or a.date_from) + dt.timedelta(days=1)).astimezone().timestamp()
     probe = c.get_library_page()
     ts0 = next((i.timestamp for i in probe.items if i.timestamp), None)
     mult = 1_000_000 if ts0 and ts0 > 10**14 else 1000 if ts0 and ts0 > 10**11 else 1
@@ -95,7 +99,7 @@ def search(a):
     hits.sort(key=lambda i: unix_seconds(i.timestamp) or 0)
     print(f"기간 안 항목 {len(infos)}개, 조건에 맞는 것 {len(hits)}개", flush=True)
     for i in hits:
-        t = dt.datetime.fromtimestamp(unix_seconds(i.timestamp), KST)
+        t = dt.datetime.fromtimestamp(unix_seconds(i.timestamp))
         print(f"{t:%Y-%m-%d %H:%M:%S}\t{i.size or '?'}\t{i.file_name}", flush=True)
     if a.download and hits:
         out = Path(a.download).expanduser()
@@ -107,7 +111,7 @@ def search(a):
             if not url:
                 print("받기 실패(주소 없음):", i.file_name, flush=True)
                 continue
-            taken = dt.datetime.fromtimestamp(unix_seconds(i.timestamp), KST)
+            taken = dt.datetime.fromtimestamp(unix_seconds(i.timestamp)).astimezone()
             d = _http_download(c, url, out, i.file_name, i.media_key, taken)
             print("받음:", d, d.stat().st_size, flush=True)
 
@@ -119,7 +123,7 @@ def main():
     sub.add_parser("logout")
     w = sub.add_parser("whoami"); w.add_argument("--account", type=int, default=0)
     s = sub.add_parser("search")
-    s.add_argument("--from", dest="date_from", required=True, help="YYYY-MM-DD (한국 시간 촬영일)")
+    s.add_argument("--from", dest="date_from", required=True, help="YYYY-MM-DD (이 맥 시간대 기준 촬영일)")
     s.add_argument("--to", dest="date_to", help="YYYY-MM-DD, 없으면 --from 하루만")
     s.add_argument("--name", nargs="*", help="파일 이름 앞부분 (여러 개 가능)")
     s.add_argument("--account", type=int, default=0, help="photos.google.com/u/N 의 N")
