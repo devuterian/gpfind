@@ -39,6 +39,7 @@ gpfind login        # Chromium 창에서 로그인, 사진 목록이 뜨면 자�
 gpfind whoami [--account N]
 gpfind search --from 2019-07-29 --to 2019-07-31 --name DSC01621 DJI_2025
 gpfind search --from 2025-07-10 --name DJI_20250710051936 --download ~/Downloads/gphotos
+gpfind share --album "여행 2025"
 gpfind logout
 ```
 
@@ -55,7 +56,8 @@ gpfind logout
 - `--name`은 파일 이름 앞부분(대소문자 무시). 여러 개 줄 수 있고, 빼면 그 기간 전체 목록이 나온다.
 - `--account N`은 `photos.google.com/u/N`의 N.
 - `--download`로 받은 파일은 수정 시각이 촬영 시각으로 맞춰진다.
-- Google 포토에서 지우거나 바꾸는 기능은 없다. 읽기와 받기만 한다.
+- `share`는 앨범 공유 링크(`photos.app.goo.gl/…`)를 만든다. 링크가 있으면 누구나 그 앨범을 볼 수 있다. 이미 링크가 있는 앨범이면 새로 안 만들고 그 링크를 보여준다. 제목이 정확히 같은 앨범이 없으면 제목에 그 글자가 들어간 앨범을 찾고, 여러 개면 목록만 보여주고 멈춘다.
+- Google 포토에서 지우는 기능은 없다. 바꾸는 건 `share`(앨범을 링크로 공개)뿐이다.
 
 ## 라이선스
 

@@ -39,6 +39,7 @@ Your login (cookies and browser profile) is stored only in `~/.local/share/googl
 gpfind whoami [--account N]
 gpfind search --from 2019-07-29 --to 2019-07-31 --name DSC01621 DJI_2025
 gpfind search --from 2025-07-10 --name DJI_20250710051936 --download ~/Downloads/gphotos
+gpfind share --album "Trip 2025"
 gpfind logout
 ```
 
@@ -57,7 +58,8 @@ Each match is printed as `capture time ⇥ size (bytes) ⇥ file name`. Status m
 - `--name` matches the start of the file name, case-insensitive. You can pass several; leave it out to list everything in the range.
 - `--account N` is the N in `photos.google.com/u/N`.
 - Files saved with `--download` get their modification time set to the capture time.
-- It never deletes or edits anything in Google Photos. Read and download only.
+- `share` creates a share link (`photos.app.goo.gl/…`) for an album. Anyone with the link can see the album. If the album already has a link, it prints that one instead of making a new one. Without an exact title match it looks for albums whose title contains the text, and stops with a list if there is more than one.
+- It never deletes anything in Google Photos. The only change it makes is `share` (making an album viewable by link).
 
 ## License
 

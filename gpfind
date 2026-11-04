@@ -7,10 +7,11 @@ google-photos-sync(github.com/trialuser/google-photos-sync)의 비공식 웹 API
   gpfind login                      Chromium 창에서 로그인 (사진 목록이 뜨면 자동 저장)
   gpfind whoami [--account N]       로그인된 계정 확인
   gpfind search --from 2019-07-29 [--to 2019-07-31] [--name DSC01621 ...] [--account N] [--download 폴더]
+  gpfind share --album "앨범 제목" [--account N]   앨범 공유 링크 만들기 (이미 있으면 그 링크)
   gpfind logout                     로그인 정보 지우기
 
 날짜는 이 맥의 시간대 기준 촬영일(끝 날짜 포함). --name은 파일 이름 앞부분, 대소문자 무시.
-Google 포토에서 지우거나 바꾸는 기능은 없다.
+Google 포토에서 지우는 기능은 없다. 바꾸는 건 share(앨범을 링크로 공개)뿐이다.
 """
 import argparse, datetime as dt, os, sys, time
 from pathlib import Path
@@ -116,6 +117,47 @@ def search(a):
             print("받음:", d, d.stat().st_size, flush=True)
 
 
+def share(a):
+    # photos.google.com에서 앨범 > 공유 > 링크 만들기를 누를 때 보내는 요청(SFKp8c) 그대로.
+    import json, re
+    from gpsync.parser import Album
+    c = client(a.account)
+    print("계정:", c.email, flush=True)
+    albums, page_id = [], None
+    while True:
+        raw = c.rpc("Z5xsfc", [page_id, None, None, None, 1, None, None, 100, [2], 5], parse=False) or []
+        for item in raw[0] or []:
+            al = Album.from_data(item)
+            m = re.search(r"https://photos\.app\.goo\.gl/[A-Za-z0-9]+", json.dumps(item))
+            al.link = m.group(0) if m else None
+            albums.append(al)
+        page_id = raw[1] if len(raw) > 1 else None
+        if not page_id:
+            break
+    hits = [al for al in albums if al.title == a.album] or [al for al in albums if a.album in (al.title or "")]
+    if not hits:
+        sys.exit(f"'{a.album}' 앨범을 찾을 수 없어요. 제목을 확인하세요.")
+    if len(hits) > 1:
+        print("제목이 겹치는 앨범이 여러 개예요. 정확한 제목으로 다시 실행하세요:", file=sys.stderr)
+        for al in hits:
+            print(f"  {al.title}  ({al.item_count}개)", file=sys.stderr)
+        sys.exit(1)
+    al = hits[0]
+    if al.link:
+        print(f"{al.title}\t{al.item_count}개\t{al.link}\t(이미 있던 링크)", flush=True)
+        return
+    req = [None, None,
+           [None, 1, None, None, 1, None, [[[1, 1], 1], [[1, 2], 1], [[2, 1], 1], [[2, 2], 1], [[3, 1], 1]],
+            None, None, None, None, None, None, [1, 2]],
+           [1, [[al.media_key], [1, 2, 3]], None, None, None, None, [1]],
+           None, None, None, None, [1, 2, 3, 5, 6]]
+    res = c.rpc("SFKp8c", req, parse=False)
+    link = res[1] if isinstance(res, list) and len(res) > 1 else None
+    if not link:
+        sys.exit(f"링크를 만들 수 없어요. 응답: {res!r}")
+    print(f"{al.title}\t{al.item_count}개\t{link}", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Google 포토 촬영일·파일명 검색과 원본 받기")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -128,6 +170,9 @@ def main():
     s.add_argument("--name", nargs="*", help="파일 이름 앞부분 (여러 개 가능)")
     s.add_argument("--account", type=int, default=0, help="photos.google.com/u/N 의 N")
     s.add_argument("--download", help="원본을 받을 폴더")
+    sh = sub.add_parser("share", help="앨범 공유 링크 만들기")
+    sh.add_argument("--album", required=True, help="앨범 제목 (정확히 같은 게 없으면 포함하는 것)")
+    sh.add_argument("--account", type=int, default=0, help="photos.google.com/u/N 의 N")
     a = ap.parse_args()
     if a.cmd == "login":
         login()
@@ -138,6 +183,8 @@ def main():
         print("로그인 정보 삭제 완료")
     elif a.cmd == "whoami":
         print(client(a.account).email)
+    elif a.cmd == "share":
+        share(a)
     else:
         search(a)
 
