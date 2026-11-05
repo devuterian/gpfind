@@ -7,11 +7,18 @@ google-photos-sync(github.com/trialuser/google-photos-sync)의 비공식 웹 API
   gpfind login                      Chromium 창에서 로그인 (사진 목록이 뜨면 자동 저장)
   gpfind whoami [--account N]       로그인된 계정 확인
   gpfind search --from 2019-07-29 [--to 2019-07-31] [--name DSC01621 ...] [--account N] [--download 폴더]
-  gpfind share --album "앨범 제목" [--account N]   앨범 공유 링크 만들기 (이미 있으면 그 링크)
+  gpfind verify 폴더 [--account N]   폴더 안 파일이 Google 포토에 원본 그대로 있는지 (내용 해시로 대조)
+  gpfind albums [--items "앨범 제목"] [--account N]   앨범 목록, 또는 앨범 안 항목
+  gpfind share --album "앨범 제목" [--collab] [--location] [--account N]   앨범 공유 링크 만들기
+  gpfind unshare --album "앨범 제목" [--yes] [--account N]   공유 링크 끄기
+  gpfind album-delete --album "앨범 제목" [--yes] [--account N]   앨범 삭제 (사진은 남음)
   gpfind logout                     로그인 정보 지우기
 
 날짜는 이 맥의 시간대 기준 촬영일(끝 날짜 포함). --name은 파일 이름 앞부분, 대소문자 무시.
-Google 포토에서 지우는 기능은 없다. 바꾸는 건 share(앨범을 링크로 공개)뿐이다.
+--album은 제목이 정확히 같아야 한다. 제목이 겹치면 앨범 키를 대신 넣는다.
+Google 포토를 바꾸는 명령은 share, unshare, album-delete뿐이다. 사진·동영상을 지우는 기능은 없다.
+unshare와 album-delete는 --yes 없이 실행하면 무엇이 바뀌는지만 보여주고, 남이 만든 앨범은 건드리지 않는다.
+verify 종료 코드: 0 전부 있음, 1 없는 파일 있음, 2 못 읽은 파일 있음.
 """
 import argparse, datetime as dt, os, sys, time
 from pathlib import Path
@@ -24,6 +31,11 @@ if Path(sys.prefix).resolve() != (ROOT / ".venv").resolve():
     os.execv(str(VENV_PY), [str(VENV_PY), os.path.realpath(__file__), *sys.argv[1:]])
 DATA = ROOT / "gpsync-data"
 COOKIES = DATA / "cookies.txt"
+LINK_PREFIX = "https://photos.app.goo.gl/"
+
+
+class Fail(Exception):
+    """사용자에게 그대로 보여줄 오류."""
 
 
 def login():
@@ -64,8 +76,115 @@ def client(account):
     return PhotosClient(COOKIES, account, 0.3)
 
 
+def call(c, rpc_id, data, *, write=False):
+    """batchexecute 요청 하나.
+
+    읽기는 네트워크 오류일 때만 두 번 더 시도한다. Google 포토를 바꾸는 요청(write)은 절대 다시 보내지 않는다.
+    Google이 거절하면(응답의 오류 코드) 그 코드를 보여주고 멈춘다. 결과가 비어 있으면 None.
+    """
+    import json, urllib.parse, requests
+    from gpsync.client import SessionExpired
+    g = c.global_data
+    query = {"rpcids": rpc_id, "source-path": c.base_path, "f.sid": g["FdrFJe"], "bl": g["cfb2h"], "rt": "c"}
+    body = {"f.req": json.dumps([[[rpc_id, json.dumps(data, separators=(",", ":")), None, "generic"]]], separators=(",", ":")),
+            "at": g["SNlM0e"]}
+    encoded = "&".join(f"{k}={urllib.parse.quote(v, safe='')}" for k, v in body.items())
+    url = f"https://photos.google.com{g['Im6cmf']}/data/batchexecute"
+    time.sleep(c.pause_s)
+    for attempt in range(1 if write else 3):
+        try:
+            r = c.session.post(url, data=encoded, params=query, timeout=60)
+        except requests.RequestException as e:
+            if write:
+                raise Fail(f"{rpc_id} 요청 중 연결이 끊겨서 바뀌었는지 알 수 없어요({e}). Google 포토 웹에서 확인하세요.")
+            if attempt == 2:
+                raise Fail(f"Google 포토에 연결할 수 없어요({e}). 인터넷 연결을 확인하세요.")
+            time.sleep(2 * (attempt + 1))
+            continue
+        if r.status_code == 401 or "accounts.google.com" in r.url:
+            raise SessionExpired("batchexecute 401")
+        if r.status_code >= 500 and not write and attempt < 2:
+            time.sleep(2 * (attempt + 1))
+            continue
+        if r.status_code >= 400:
+            if write and (r.status_code >= 500 or r.status_code == 429):
+                raise Fail(f"{rpc_id} 요청에 Google이 HTTP {r.status_code}로 답해서 바뀌었는지 알 수 없어요. Google 포토 웹에서 확인하세요.")
+            raise Fail(f"{rpc_id} 요청이 실패했어요(HTTP {r.status_code}).")
+        try:
+            env = next((json.loads(line)[0] for line in r.text.split("\n") if "wrb.fr" in line), None)
+        except (ValueError, IndexError) as e:
+            raise Fail(f"{rpc_id} 응답을 읽을 수 없어요({e}).")
+        if env is None:
+            raise SessionExpired("응답에 wrb.fr 없음")
+        if env[2] is None:
+            code = env[5] if len(env) > 5 else None
+            if code:
+                raise Fail(f"Google이 {rpc_id} 요청을 거절했어요(오류 코드 {code}).")
+            return None
+        try:
+            return json.loads(env[2])
+        except ValueError as e:
+            raise Fail(f"{rpc_id} 응답을 읽을 수 없어요({e}).")
+
+
+def all_albums(c):
+    import json
+    from gpsync.parser import Album
+    albums, page_id = [], None
+    while True:
+        raw = call(c, "Z5xsfc", [page_id, None, None, None, 1, None, None, 100, [2], 5]) or []
+        for item in (raw[0] if raw else None) or []:
+            al = Album.from_data(item)
+            s = json.dumps(item)
+            i = s.find(LINK_PREFIX)
+            al.link = s[i:s.index('"', i)] if i >= 0 else None
+            # 공유된 앨범은 목록에 공유용 키로 나오고, 원래 앨범 키는 확장 필드 8번에 있다(앨범 삭제에 필요).
+            ext = item[-1].get("72930366") if isinstance(item[-1], dict) else None
+            base = ext[8] if isinstance(ext, list) and len(ext) > 8 else None
+            shared = bool(al.is_shared or al.link)
+            al.base_key = base if shared and isinstance(base, str) and base.startswith("AF1Qip") else al.media_key
+            albums.append(al)
+        page_id = raw[1] if len(raw) > 1 else None
+        if not page_id:
+            return albums
+
+
+def require_mine(c, al):
+    """남이 만든 공유 앨범(내가 참여만 한 것)은 바꾸지 않는다. 앨범 정보의 주인 계정 번호로 가린다."""
+    r = call(c, "snAcKc", [al.media_key, None, None, al.auth_key])
+    try:
+        owner = r[3][5][1]
+    except (TypeError, IndexError):
+        owner = None
+    me = c.global_data.get("qDCSke")
+    if not owner or not me:
+        raise Fail("앨범 주인을 확인할 수 없어서 멈췄어요. Google 포토 웹에서 확인하세요.")
+    if owner != me:
+        raise Fail(f"'{al.title}'은(는) 다른 사람이 만든 앨범이에요. gpfind로는 바꾸지 않아요.")
+
+
+def pick_album(albums, name):
+    hits = [al for al in albums if al.title == name or al.media_key == name]
+    if len(hits) == 1:
+        return hits[0]
+    if hits:
+        rows = "\n".join(f"  {al.media_key}\t{al.item_count}개\t{al.link or '-'}" for al in hits)
+        raise Fail(f"제목이 '{name}'인 앨범이 {len(hits)}개예요. 제목 대신 앨범 키로 다시 실행하세요:\n{rows}")
+    near = [al.title for al in albums if name.lower() in (al.title or "").lower()]
+    msg = f"제목이 '{name}'인 앨범이 없어요."
+    if near:
+        msg += " 비슷한 앨범:\n" + "\n".join(f"  {t}" for t in near[:10]) + "\n정확한 제목으로 다시 실행하세요."
+    raise Fail(msg)
+
+
+def fmt_size(n):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+
+
 def search(a):
-    from gpsync.download import _http_download
     from gpsync.util import unix_seconds
     c = client(a.account)
     print("계정:", c.email, flush=True)
@@ -75,7 +194,7 @@ def search(a):
     ts0 = next((i.timestamp for i in probe.items if i.timestamp), None)
     mult = 1_000_000 if ts0 and ts0 > 10**14 else 1000 if ts0 and ts0 > 10**11 else 1
 
-    keys, page_id, ts, pages = [], None, int(hi * mult), 0
+    keys, page_id, ts, pages, done = [], None, int(hi * mult), 0, False
     while pages < 200:
         p = c.get_library_page(timestamp=ts, page_id=page_id)
         pages += 1
@@ -89,8 +208,11 @@ def search(a):
             elif t < hi and it.media_key:
                 keys.append(it.media_key)
         if old or not p.next_page_id:
+            done = True
             break
         page_id, ts = p.next_page_id, p.last_item_timestamp
+    if not done:
+        print("경고: 기간 안 항목이 너무 많아서 최근 쪽 일부만 봤어요. --from/--to를 좁혀서 다시 실행하세요.", file=sys.stderr)
     keys = list(dict.fromkeys(keys))
     infos = []
     for o in range(0, len(keys), 80):
@@ -100,93 +222,293 @@ def search(a):
     hits.sort(key=lambda i: unix_seconds(i.timestamp) or 0)
     print(f"기간 안 항목 {len(infos)}개, 조건에 맞는 것 {len(hits)}개", flush=True)
     for i in hits:
-        t = dt.datetime.fromtimestamp(unix_seconds(i.timestamp))
-        print(f"{t:%Y-%m-%d %H:%M:%S}\t{i.size or '?'}\t{i.file_name}", flush=True)
+        t = unix_seconds(i.timestamp)
+        print(f"{dt.datetime.fromtimestamp(t):%Y-%m-%d %H:%M:%S}\t" if t else "?\t", end="")
+        print(f"{i.size or '?'}\t{i.file_name}", flush=True)
     if a.download and hits:
-        out = Path(a.download).expanduser()
-        out.mkdir(parents=True, exist_ok=True)
-        for i in hits:
+        download(c, a, hits)
+    if not done:
+        sys.exit(1)
+
+
+def download(c, a, hits):
+    import shutil, requests
+    from collections import Counter
+    from gpsync.client import PhotosApiError
+    from gpsync.download import _http_download
+    from gpsync.util import unix_seconds, sanitize_filename
+    out = Path(a.download).expanduser()
+    out.mkdir(parents=True, exist_ok=True)
+
+    names = Counter(sanitize_filename(i.file_name) for i in hits if i.file_name)
+    dup = {n for n, k in names.items() if k > 1}
+    if dup:
+        print(f"이름이 겹치는 항목이 있어서({', '.join(sorted(dup)[:5])}) 그 파일들은 이미 받았는지 확인하지 않고 받아요.",
+              file=sys.stderr)
+
+    def existing(i):
+        n = sanitize_filename(i.file_name) if i.file_name else None
+        d = out / n if n and n not in dup else None
+        return d if d and d.is_file() and i.size and d.stat().st_size == i.size else None
+
+    todo = [i for i in hits if not existing(i)]
+    need, free = sum(i.size or 0 for i in todo), shutil.disk_usage(out).free
+    if need > free - 2 * 1024**3:
+        raise Fail(f"{out} 에 공간이 모자라요. 받을 용량 {fmt_size(need)}, 남은 공간 {fmt_size(free)}(2GB는 남겨 둠).")
+    failed = 0
+    for i in hits:
+        d = existing(i)
+        if d:
+            print("이미 있음:", d, flush=True)
+            continue
+        try:
             info = c.get_item_info(i.media_key)
             url = (info.download_original_url or info.download_url) if info else None
             url = url or c.get_download_url([i.media_key])
             if not url:
-                print("받기 실패(주소 없음):", i.file_name, flush=True)
-                continue
-            taken = dt.datetime.fromtimestamp(unix_seconds(i.timestamp)).astimezone()
+                raise Fail("받을 주소가 없음")
+            t = unix_seconds(i.timestamp)
+            taken = dt.datetime.fromtimestamp(t).astimezone() if t else None
             d = _http_download(c, url, out, i.file_name, i.media_key, taken)
             print("받음:", d, d.stat().st_size, flush=True)
+        except (Fail, PhotosApiError, requests.RequestException, OSError) as e:
+            failed += 1
+            print(f"받기 실패: {i.file_name} ({e})", file=sys.stderr, flush=True)
+    if failed:
+        raise Fail(f"{failed}개를 받지 못했어요. 같은 명령을 다시 실행하면 받은 파일은 건너뛰고 나머지만 받아요.")
+
+
+def verify(a):
+    # 웹에서 파일을 올릴 때 "이미 있나?"를 묻는 요청(swbisb)에 SHA-1을 보낸다. 읽기만 한다.
+    import base64, hashlib
+    root = Path(a.folder).expanduser()
+    if not root.exists():
+        raise Fail(f"{root} 이(가) 없어요.")
+    if root.is_file():
+        files, base = [root], root.parent
+    else:
+        files = sorted(p for p in root.rglob("*")
+                       if p.is_file() and not any(s.startswith(".") for s in p.relative_to(root).parts))
+        base = root
+    if not files:
+        raise Fail(f"{root} 안에 확인할 파일이 없어요.")
+    total = sum(p.stat().st_size for p in files if p.exists())
+    c = client(a.account)
+    print("계정:", c.email, flush=True)
+    print(f"파일 {len(files)}개, {fmt_size(total)} 내용 해시 계산하면서 대조하는 중", file=sys.stderr, flush=True)
+
+    def sha1(p):
+        h = hashlib.sha1()
+        with open(p, "rb") as f:
+            while chunk := f.read(8 * 1024 * 1024):
+                h.update(chunk)
+        return base64.b64encode(h.digest()).decode()
+
+    present = missing = errors = 0
+    batch, batch_bytes = [], 0
+
+    def flush():
+        nonlocal present, missing
+        hashes = list(dict.fromkeys(h for h, _, _ in batch))
+        res = call(c, "swbisb", [hashes, None, 3, 0]) or []
+        found = {row[0] for row in (res[0] if res else None) or [] if row}
+        for h, p, size in batch:
+            ok = h in found
+            present += ok
+            missing += not ok
+            print(f"{'있음' if ok else '없음'}\t{size}\t{p.relative_to(base)}", flush=True)
+        batch.clear()
+
+    for p in files:
+        try:
+            size = p.stat().st_size
+            batch.append((sha1(p), p, size))
+        except OSError as e:
+            errors += 1
+            print(f"오류\t-\t{p.relative_to(base)}\t{e.strerror or e}", flush=True)
+            continue
+        batch_bytes += size
+        if len(batch) >= 50 or batch_bytes >= 4 * 1024**3:
+            flush()
+            batch_bytes = 0
+    if batch:
+        flush()
+    print(f"있음 {present}개, 없음 {missing}개" + (f", 못 읽음 {errors}개" if errors else ""), flush=True)
+    if missing:
+        print("없음 = 내용이 똑같은 원본이 없다는 뜻이에요. '저장용량 절약' 화질로 올렸거나 편집본만 있어도 없음으로 나와요.",
+              file=sys.stderr)
+    if errors:
+        sys.exit(2)
+    if missing:
+        sys.exit(1)
+
+
+def albums(a):
+    c = client(a.account)
+    print("계정:", c.email, flush=True)
+    found = all_albums(c)
+    if not a.items:
+        for al in sorted(found, key=lambda x: (x.title or "").lower()):
+            print(f"{al.title or '(제목 없음)'}\t{al.item_count}개\t{al.link or '-'}\t{al.media_key}", flush=True)
+        print(f"앨범 {len(found)}개", flush=True)
+        return
+    from gpsync.util import unix_seconds
+    al = pick_album(found, a.items)
+    keys = [it.media_key for it in c.iter_album_items(al.media_key, al.auth_key) if it.media_key]
+    infos = []
+    for o in range(0, len(keys), 80):
+        infos += c.get_batch_media_info(keys[o:o + 80])
+    infos.sort(key=lambda i: unix_seconds(i.timestamp) or 0)
+    print(f"{al.title}\t{len(infos)}개\t{al.link or '-'}", flush=True)
+    for i in infos:
+        t = dt.datetime.fromtimestamp(unix_seconds(i.timestamp)) if unix_seconds(i.timestamp) else None
+        print(f"{t:%Y-%m-%d %H:%M:%S}\t{i.size or '?'}\t{i.file_name}" if t else f"?\t{i.size or '?'}\t{i.file_name}", flush=True)
 
 
 def share(a):
-    # photos.google.com에서 앨범 > 공유 > 링크 만들기를 누를 때 보내는 요청(SFKp8c) 그대로.
-    import json, re
-    from gpsync.parser import Album
+    # photos.google.com에서 앨범 > 공유 > 링크 만들기를 누를 때 보내는 요청(SFKp8c).
+    # 웹 기본값은 공동작업·촬영 장소 공유가 켜져 있지만, 여기선 --collab/--location을 줄 때만 켠다.
     c = client(a.account)
     print("계정:", c.email, flush=True)
-    albums, page_id = [], None
-    while True:
-        raw = c.rpc("Z5xsfc", [page_id, None, None, None, 1, None, None, 100, [2], 5], parse=False) or []
-        for item in raw[0] or []:
-            al = Album.from_data(item)
-            m = re.search(r"https://photos\.app\.goo\.gl/[A-Za-z0-9]+", json.dumps(item))
-            al.link = m.group(0) if m else None
-            albums.append(al)
-        page_id = raw[1] if len(raw) > 1 else None
-        if not page_id:
-            break
-    hits = [al for al in albums if al.title == a.album] or [al for al in albums if a.album in (al.title or "")]
-    if not hits:
-        sys.exit(f"'{a.album}' 앨범을 찾을 수 없어요. 제목을 확인하세요.")
-    if len(hits) > 1:
-        print("제목이 겹치는 앨범이 여러 개예요. 정확한 제목으로 다시 실행하세요:", file=sys.stderr)
-        for al in hits:
-            print(f"  {al.title}  ({al.item_count}개)", file=sys.stderr)
-        sys.exit(1)
-    al = hits[0]
+    al = pick_album(all_albums(c), a.album)
     if al.link:
         print(f"{al.title}\t{al.item_count}개\t{al.link}\t(이미 있던 링크)", flush=True)
+        print("이미 있던 링크라 공동작업·촬영 장소 설정은 건드리지 않았어요. 웹에서 앨범 > 옵션에서 확인하세요.", file=sys.stderr)
         return
-    req = [None, None,
-           [None, 1, None, None, 1, None, [[[1, 1], 1], [[1, 2], 1], [[2, 1], 1], [[2, 2], 1], [[3, 1], 1]],
-            None, None, None, None, None, None, [1, 2]],
+    collab = 1 if a.collab else 0
+    opts = [[[1, 1], collab], [[1, 2], collab], [[2, 1], 1], [[2, 2], 1], [[3, 1], 1]]  # 1=공동작업 2=댓글 3=링크 공유
+    req = [None, None, [None, 1, None, None, 1, None, opts, None, None, None, None, None, None, [1, 2]],
            [1, [[al.media_key], [1, 2, 3]], None, None, None, None, [1]],
            None, None, None, None, [1, 2, 3, 5, 6]]
-    res = c.rpc("SFKp8c", req, parse=False)
-    link = res[1] if isinstance(res, list) and len(res) > 1 else None
-    if not link:
-        sys.exit(f"링크를 만들 수 없어요. 응답: {res!r}")
+    res = call(c, "SFKp8c", req, write=True)
+    link = res[1] if isinstance(res, list) and len(res) > 1 and isinstance(res[1], str) else ""
+    shared_key = res[0] if link else None
+    if not link.startswith(LINK_PREFIX) or not link[len(LINK_PREFIX):].isalnum():
+        raise Fail(f"링크를 만들지 못했어요. 응답: {res!r}")
+    warn = None
+    if not a.location:
+        # 앨범 > 옵션 > 사진 촬영 장소 공유 끄기(X8k0cf). 697은 웹이 보낸 값 그대로(뜻은 모름).
+        token = c.global_data.get("thykhd")
+        try:
+            if not token or not isinstance(shared_key, str):
+                raise Fail("페이지 토큰이나 앨범 키 없음")
+            call(c, "X8k0cf", [[shared_key], [2], [2, None, token, 697]], write=True)
+        except Exception as e:
+            warn = f"촬영 장소 공유를 끄지 못했어요({e}). 웹에서 앨범 > 옵션 > 사진 촬영 장소 공유를 끄세요."
+    if not any(x.link == link for x in all_albums(c)):
+        raise Fail(f"링크({link})를 받았지만 앨범 목록에서 확인되지 않아요. Google 포토 웹에서 확인하세요.")
     print(f"{al.title}\t{al.item_count}개\t{link}", flush=True)
+    place = "공개" if a.location else "공개(끄기 실패)" if warn else "숨김"
+    print(f"공동작업 {'켬' if a.collab else '끔'}, 촬영 장소 {place}, 댓글 켬", flush=True)
+    if warn:
+        raise Fail(warn)
+
+
+def unshare(a):
+    # 앨범 > 옵션 > 링크 공유 끄기 > 비공개로 설정(NGGKab).
+    c = client(a.account)
+    print("계정:", c.email, flush=True)
+    al = pick_album(all_albums(c), a.album)
+    if not al.link:
+        print(f"'{al.title}'은(는) 이미 링크 공유가 꺼져 있어요.", flush=True)
+        return
+    print(f"{al.title}\t{al.item_count}개\t{al.link}", flush=True)
+    require_mine(c, al)
+    if not a.yes:
+        print("링크를 끄면 이 링크로는 더 이상 앨범을 볼 수 없어요. 앨범에 참여한 사람도 빠지고, 다시 공유하면 새 링크가 생겨요.\n"
+              "끄려면 --yes를 붙여서 다시 실행하세요.", flush=True)
+        return
+    call(c, "NGGKab", [al.media_key, 1, 2], write=True)
+    if any(x.link == al.link for x in all_albums(c)):
+        raise Fail("끄는 요청은 보냈지만 링크가 아직 남아 있어요. Google 포토 웹에서 확인하세요.")
+    print("링크 공유 끔", flush=True)
+
+
+def album_delete(a):
+    # 앨범 > 옵션 더보기 > 앨범 삭제(nV6Qv). 앨범만 없어지고 사진·동영상은 라이브러리에 남는다.
+    c = client(a.account)
+    print("계정:", c.email, flush=True)
+    al = pick_album(all_albums(c), a.album)
+    require_mine(c, al)
+    keys = {it.media_key for it in c.iter_album_items(al.media_key, al.auth_key) if it.media_key}
+    print(f"{al.title}\t{al.item_count}개\t{al.link or '-'}", flush=True)
+    notes = [f"앨범만 지워지고 안에 있던 사진·동영상 {len(keys)}개는 라이브러리에 남아요."]
+    if al.link:
+        notes.append("공유 링크도 같이 없어져서, 링크로 보던 사람도 더 이상 못 봐요.")
+    notes.append("앨범 삭제는 되돌릴 수 없어요.")
+    print("\n".join(notes), flush=True)
+    if not a.yes:
+        print("지우려면 --yes를 붙여서 다시 실행하세요.", flush=True)
+        return
+    call(c, "nV6Qv", [None, None, [[al.base_key, None, 1]]], write=True)
+    if any(x.media_key in (al.media_key, al.base_key) for x in all_albums(c)):
+        raise Fail("삭제 요청은 보냈지만 앨범이 아직 보여요. Google 포토 웹에서 확인하세요.")
+    trashed, page_id = set(), None
+    for _ in range(100):
+        t = call(c, "zy0IHe", [page_id]) or []
+        trashed |= keys & {it[0] for it in ((t[0] if t else None) or []) if it}
+        page_id = t[1] if len(t) > 1 else None
+        if not page_id:
+            break
+    if trashed:
+        raise Fail(f"앨범은 지웠지만 안에 있던 항목 {len(trashed)}개가 휴지통에 있어요. photos.google.com/trash 에서 복원하세요.")
+    print("앨범 삭제 완료 (사진·동영상은 그대로)", flush=True)
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Google 포토 촬영일·파일명 검색과 원본 받기")
+    ap = argparse.ArgumentParser(description="Google 포토 촬영일·파일명 검색과 원본 받기, 원본 대조, 앨범 관리")
     sub = ap.add_subparsers(dest="cmd", required=True)
+    acct = argparse.ArgumentParser(add_help=False)
+    acct.add_argument("--account", type=int, default=0, help="photos.google.com/u/N 의 N")
     sub.add_parser("login")
     sub.add_parser("logout")
-    w = sub.add_parser("whoami"); w.add_argument("--account", type=int, default=0)
-    s = sub.add_parser("search")
+    sub.add_parser("whoami", parents=[acct])
+    s = sub.add_parser("search", parents=[acct])
     s.add_argument("--from", dest="date_from", required=True, help="YYYY-MM-DD (이 맥 시간대 기준 촬영일)")
     s.add_argument("--to", dest="date_to", help="YYYY-MM-DD, 없으면 --from 하루만")
     s.add_argument("--name", nargs="*", help="파일 이름 앞부분 (여러 개 가능)")
-    s.add_argument("--account", type=int, default=0, help="photos.google.com/u/N 의 N")
     s.add_argument("--download", help="원본을 받을 폴더")
-    sh = sub.add_parser("share", help="앨범 공유 링크 만들기")
-    sh.add_argument("--album", required=True, help="앨범 제목 (정확히 같은 게 없으면 포함하는 것)")
-    sh.add_argument("--account", type=int, default=0, help="photos.google.com/u/N 의 N")
+    v = sub.add_parser("verify", parents=[acct], help="폴더 안 파일이 Google 포토에 원본 그대로 있는지")
+    v.add_argument("folder", help="확인할 폴더나 파일")
+    al = sub.add_parser("albums", parents=[acct], help="앨범 목록 (--items면 그 앨범 안 항목)")
+    al.add_argument("--items", metavar="앨범", help="이 앨범 안 항목 보기 (정확한 제목이나 앨범 키)")
+    sh = sub.add_parser("share", parents=[acct], help="앨범 공유 링크 만들기")
+    sh.add_argument("--album", required=True, help="정확한 앨범 제목이나 앨범 키")
+    sh.add_argument("--collab", action="store_true", help="링크가 있는 사람도 사진을 추가할 수 있게 (기본: 끔)")
+    sh.add_argument("--location", action="store_true", help="사진 촬영 장소도 공개 (기본: 숨김)")
+    for name, helptext in (("unshare", "공유 링크 끄기"), ("album-delete", "앨범 삭제 (사진은 남음)")):
+        x = sub.add_parser(name, parents=[acct], help=helptext)
+        x.add_argument("--album", required=True, help="정확한 앨범 제목이나 앨범 키")
+        x.add_argument("--yes", action="store_true", help="이게 없으면 무엇이 바뀌는지만 보여줌")
     a = ap.parse_args()
-    if a.cmd == "login":
-        login()
-    elif a.cmd == "logout":
-        import shutil
-        COOKIES.unlink(missing_ok=True)
-        shutil.rmtree(DATA / "browser-profile", ignore_errors=True)
-        print("로그인 정보 삭제 완료")
-    elif a.cmd == "whoami":
-        print(client(a.account).email)
-    elif a.cmd == "share":
-        share(a)
-    else:
-        search(a)
+
+    import requests
+    from gpsync.client import SessionExpired, PhotosApiError
+    try:
+        if a.cmd == "login":
+            login()
+        elif a.cmd == "logout":
+            import shutil
+            COOKIES.unlink(missing_ok=True)
+            shutil.rmtree(DATA / "browser-profile", ignore_errors=True)
+            print("로그인 정보 삭제 완료")
+        elif a.cmd == "whoami":
+            print(client(a.account).email)
+        else:
+            {"search": search, "verify": verify, "albums": albums, "share": share,
+             "unshare": unshare, "album-delete": album_delete}[a.cmd](a)
+    except SessionExpired:
+        sys.exit("로그인이 풀렸어요. gpfind login을 다시 실행하세요.")
+    except PhotosApiError as e:
+        sys.exit(f"Google 포토 요청이 실패했어요({e}). 잠시 후 다시 실행하세요. 계속 실패하면 gpfind login을 다시 실행하세요.")
+    except Fail as e:
+        sys.exit(str(e))
+    except requests.RequestException as e:
+        sys.exit(f"Google 포토에 연결할 수 없어요({e.__class__.__name__}). 인터넷 연결을 확인하세요.")
+    except (OSError, ValueError) as e:
+        sys.exit(f"실행할 수 없어요: {e}")
+    except KeyboardInterrupt:
+        sys.exit("중지됨")
 
 
 if __name__ == "__main__":

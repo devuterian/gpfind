@@ -39,7 +39,12 @@ Your login (cookies and browser profile) is stored only in `~/.local/share/googl
 gpfind whoami [--account N]
 gpfind search --from 2019-07-29 --to 2019-07-31 --name DSC01621 DJI_2025
 gpfind search --from 2025-07-10 --name DJI_20250710051936 --download ~/Downloads/gphotos
-gpfind share --album "Trip 2025"
+gpfind verify ~/Pictures/2025-07-10          # is every file in this folder in Google Photos?
+gpfind albums                                 # list albums
+gpfind albums --items "Trip 2025"             # list what is in an album
+gpfind share --album "Trip 2025"              # make a share link
+gpfind unshare --album "Trip 2025" --yes      # turn the share link off
+gpfind album-delete --album "Trip 2025" --yes # delete the album (photos stay)
 gpfind logout
 ```
 
@@ -58,8 +63,33 @@ Each match is printed as `capture time ⇥ size (bytes) ⇥ file name`. Status m
 - `--name` matches the start of the file name, case-insensitive. You can pass several; leave it out to list everything in the range.
 - `--account N` is the N in `photos.google.com/u/N`.
 - Files saved with `--download` get their modification time set to the capture time.
-- `share` creates a share link (`photos.app.goo.gl/…`) for an album. Anyone with the link can see the album. If the album already has a link, it prints that one instead of making a new one. Without an exact title match it looks for albums whose title contains the text, and stops with a list if there is more than one.
-- It never deletes anything in Google Photos. The only change it makes is `share` (making an album viewable by link).
+- `--download` skips a file that already exists with the same name and size (except when several results share a name), and stops before downloading if there is not enough free space.
+- If the range holds too many items to scan to the end, it warns and exits with code 1.
+
+### Checking originals (`verify`)
+
+For every file in the folder (recursive, hidden files skipped) it prints `있음` (present) or `없음` (missing) `⇥ size ⇥ path`. It sends each file's SHA-1 to the request the Google Photos web app uses to ask "is this already uploaded?", so a renamed file with the same content still counts as present. Read-only.
+
+- The exit code is 1 if anything is missing and 2 if a file could not be read (`오류`), handy before moving or deleting files in a script.
+- Hidden files (starting with `.`) and symlinked subfolders are not checked, so `없음 0개` does not cover them.
+- Not tested: whether items in the trash also count as present.
+- Items uploaded in "Storage saver" quality, or edited copies, have different content and show as missing.
+- It reads every file to hash it, so a big folder takes as long as your disk needs to read it.
+
+### Albums (`albums`, `share`, `unshare`, `album-delete`)
+
+- `--album` must match the title **exactly**. If only similar titles exist it lists them and stops. If several albums share the title it lists their album keys; pass the key instead of the title.
+- `albums` prints `title ⇥ item count ⇥ share link (or -) ⇥ album key`.
+- `share` creates a link (`photos.app.goo.gl/…`). Anyone with the link can see the album. If the album already has a link it prints that one and leaves its collaboration and location settings alone.
+  - The web app turns on **collaboration** (people with the link can add photos) and **photo location sharing** when it creates a link. `gpfind share` creates it with both off. Use `--collab` and `--location` to turn them on. Comments are on, as on the web.
+- `unshare` turns link sharing off (the web's "Make private"). The old link stops working; sharing again makes a new link.
+- `album-delete` deletes only the album. Its photos and videos stay in your library. Afterwards it checks that the album is gone and that nothing went to the trash.
+- Without `--yes`, `unshare` and `album-delete` only show what would change. They refuse shared albums someone else created (ones you only joined).
+- Requests that change Google Photos are never retried. If Google rejects one, the error code is shown and it stops.
+- There is no way to delete photos or videos themselves.
+
+> [!CAUTION]
+> Changing Google Photos through unofficial internal requests may count as automation under Google's terms. Use the album-changing commands only when you need them.
 
 ## License
 
